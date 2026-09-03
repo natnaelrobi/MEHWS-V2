@@ -246,7 +246,11 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
     
     flood_probs = safe_model_predict(flood_pipe, df_f)
     if flood_probs is not None:
-        df_f['flood_risk_prob'] = flood_probs
+        # Hybrid safety net: blend model probability with physical river/slope susceptibility
+        river_risk = np.clip(1.0 - (spatial_row.get('dist_to_river_m', 1500) / 3000.0), 0.05, 0.90)
+        slope_risk = np.clip(1.0 - (spatial_row.get('slope_mean', 8.5) / 20.0), 0.05, 0.90)
+        terrain_baseline = 0.6 * river_risk + 0.4 * slope_risk
+        df_f['flood_risk_prob'] = np.maximum(flood_probs, terrain_baseline * 0.3)
     else:
         df_f['flood_risk_prob'] = np.clip(df_f['rfh_live'] / 35.0, 0.0, 1.0)
 
@@ -270,7 +274,10 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
     
     drought_probs = safe_model_predict(drought_pipe, df_d)
     if drought_probs is not None:
-        df_d['drought_risk_prob'] = drought_probs
+        # Hybrid safety net: prevent uncalibrated models from clamping drought risk universally high (>50%)
+        ndvi_val = spatial_row.get('ndvi_mean', 0.45)
+        drought_baseline = np.clip(1.1 - (ndvi_val * 1.4), 0.05, 0.85)
+        df_d['drought_risk_prob'] = 0.5 * drought_probs + 0.5 * drought_baseline
     else:
         roll_sum = df_d['rfh_cumulative_90d']
         mean_val = roll_sum.mean() if roll_sum.mean() > 0 else 1.0
@@ -284,32 +291,43 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
 # --- Scalable Hybrid National Batch Scoring Engine ---
 @st.cache_data
 def compute_national_hazard_map(df_nodes):
-    """Computes vectorized model predictions for all woredas instantly using spatial features."""
+    """Computes vectorized model predictions for all woredas instantly using spatially diverse features."""
     df_f_batch = pd.DataFrame(index=df_nodes.index)
-    df_f_batch['rfh_live'] = 1.5
-    df_f_batch['rfh_lag1'] = 1.0
-    df_f_batch['soil_moisture_mean_lag1'] = 20.0
+    df_f_batch['rfh_live'] = 2.5
+    df_f_batch['rfh_lag1'] = 2.0
+    df_f_batch['soil_moisture_mean_lag1'] = 22.0
     df_f_batch['dist_to_river_m'] = df_nodes['dist_to_river_m']
     df_f_batch['slope_mean'] = df_nodes['slope_mean']
     df_f_batch['ndvi_mean'] = df_nodes['ndvi_mean']
     
     flood_scores = safe_model_predict(flood_model, df_f_batch)
-    if flood_scores is None:
-        flood_scores = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 5000.0), 0.05, 0.85)
+    if flood_scores is None or flood_scores.max() < 0.05:
+        river_risk = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 3000.0), 0.05, 0.90)
+        slope_risk = np.clip(1.0 - (df_nodes['slope_mean'] / 20.0), 0.05, 0.90)
+        flood_scores = 0.6 * river_risk + 0.4 * slope_risk
+    else:
+        river_risk = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 3000.0), 0.05, 0.90)
+        slope_risk = np.clip(1.0 - (df_nodes['slope_mean'] / 20.0), 0.05, 0.90)
+        terrain_baseline = 0.6 * river_risk + 0.4 * slope_risk
+        flood_scores = np.maximum(flood_scores, terrain_baseline * 0.3)
         
     df_d_batch = pd.DataFrame(index=df_nodes.index)
-    df_d_batch['rfh_cumulative_90d'] = 45.0
+    # Dynamically scale cumulative precipitation based on regional NDVI to prevent nationwide uniform 50%+ risk
+    df_d_batch['rfh_cumulative_90d'] = df_nodes['ndvi_mean'] * 250.0 + 60.0
     df_d_batch['soil_moisture_mean_lag1'] = 20.0
     df_d_batch['ndvi_mean'] = df_nodes['ndvi_mean']
     df_d_batch['dist_to_river_m'] = df_nodes['dist_to_river_m']
     
     drought_scores = safe_model_predict(drought_model, df_d_batch)
-    if drought_scores is None:
-        drought_scores = np.clip(1.0 - df_nodes['ndvi_mean'], 0.05, 0.85)
+    if drought_scores is None or drought_scores.min() > 0.9:
+        drought_scores = np.clip(1.1 - (df_nodes['ndvi_mean'] * 1.4), 0.05, 0.85)
+    else:
+        drought_baseline = np.clip(1.1 - (df_nodes['ndvi_mean'] * 1.4), 0.05, 0.85)
+        drought_scores = 0.5 * drought_scores + 0.5 * drought_baseline
         
     df_res = df_nodes.copy()
-    df_res['Flood Risk Score'] = flood_scores
-    df_res['Drought Risk Score'] = drought_scores
+    df_res['Flood Risk Score'] = np.clip(flood_scores, 0.02, 0.95)
+    df_res['Drought Risk Score'] = np.clip(drought_scores, 0.05, 0.95)
     return df_res
 
 with st.sidebar:
@@ -360,7 +378,8 @@ df_s = df_s.bfill().fillna(0)
 
 seasonal_probs = safe_model_predict(drought_model, df_s)
 if seasonal_probs is not None:
-    df_s['drought_risk_prob'] = seasonal_probs
+    drought_baseline_s = np.clip(1.1 - (target_row.get('ndvi_mean', 0.45) * 1.4), 0.05, 0.85)
+    df_s['drought_risk_prob'] = 0.5 * seasonal_probs + 0.5 * drought_baseline_s
 else:
     df_s['precip_30d_rolling'] = df_s['precipitation_sum'].rolling(window=30, min_periods=5).mean().bfill()
     df_s['drought_risk_prob'] = np.clip(0.4 + 0.3 * np.sin(np.linspace(0, 3*np.pi, len(df_s))), 0.05, 0.90)
