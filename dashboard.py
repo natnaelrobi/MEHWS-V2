@@ -283,7 +283,7 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
 
 # --- Scalable Hybrid National Batch Scoring Engine ---
 @st.cache_data
-def compute_national_hazard_map(df_nodes, flood_model, drought_model):
+def compute_national_hazard_map(df_nodes):
     """Computes vectorized model predictions for all woredas instantly using spatial features."""
     df_f_batch = pd.DataFrame(index=df_nodes.index)
     df_f_batch['rfh_live'] = 1.5
@@ -479,7 +479,7 @@ def build_folium_map(df_serialized, target_zone, hazard_type, horizon_label):
     return m
 
 # Compute National Batch Scores across all Woredas
-df_national_scored = compute_national_hazard_map(df_regions, flood_model, drought_model)
+df_national_scored = compute_national_hazard_map(df_regions)
 
 with tab_map_flood:
     st.subheader("🌊 National GIS Flash Flood Command Map")
