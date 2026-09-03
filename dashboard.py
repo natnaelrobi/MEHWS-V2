@@ -12,7 +12,7 @@ from datetime import datetime
 import plotly.express as px
 
 # Import data engineering pipelines from local open_meteo.py module
-from services.open_meteo import fetch_live_weather, fetch_seasonal_climate
+from services.open_metro import fetch_live_weather, fetch_seasonal_climate
 from services.real_data_engineering import (
     load_and_clean_spatial_nodes, 
     engineer_flood_features, 
