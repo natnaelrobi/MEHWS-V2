@@ -1,17 +1,18 @@
 from pathlib import Path
-import os
 import sys
 import types
 import logging
-import requests
 import joblib
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
 from streamlit_folium import st_folium
-from datetime import datetime, timedelta
+from datetime import datetime
 import plotly.express as px
+
+# Import data engineering pipelines from local open_meteo.py module
+from open_meteo import fetch_live_weather, fetch_seasonal_climate
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -36,7 +37,6 @@ except ImportError:
     sys.modules["_loss"] = dummy_loss
     sys.modules["sklearn._loss"] = dummy_loss
 
-# Patch SimpleImputer missing _fill_dtype and attributes across scikit-learn version mismatches
 try:
     from sklearn.impute import SimpleImputer
     _old_transform = SimpleImputer.transform
@@ -147,7 +147,6 @@ def load_spatial_nodes():
         
     df = df.dropna(subset=['lat', 'lon'])
     
-    # Impute missing topographical and environmental features safely
     if 'dist_to_river_m' not in df.columns:
         df['dist_to_river_m'] = 1500.0
     if 'slope_mean' not in df.columns:
@@ -194,57 +193,8 @@ def safe_model_predict(model, df_features):
         logger.error(f"Inference error during safe_model_predict: {e}")
         return None
 
-@st.cache_data(ttl=3600)
-def fetch_live_weather(lat, lon, max_days=16):
-    """Fetches high-resolution meteorological forecast from Open-Meteo API."""
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=precipitation,soil_temperature_0cm,temperature_2m,relative_humidity_2m&daily=precipitation_sum,temperature_2m_max&timezone=Africa%2FNairobi&forecast_days={max_days}"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            df_hourly = pd.DataFrame(data['hourly'])
-            df_hourly['time'] = pd.to_datetime(df_hourly['time'])
-            df_hourly.rename(columns={
-                'precipitation': 'rfh_live', 
-                'soil_temperature_0cm': 'soil_temp', 
-                'relative_humidity_2m': 'rh', 
-                'temperature_2m': 'temp'
-            }, inplace=True)
-            
-            df_daily = pd.DataFrame(data['daily'])
-            df_daily['time'] = pd.to_datetime(df_daily['time'])
-            df_daily.rename(columns={'precipitation_sum': 'rf_daily_sum'}, inplace=True)
-            
-            api_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return df_hourly, df_daily, api_timestamp
-    except Exception as e:
-        logger.warning(f"Live API fetch failed: {e}")
-    return pd.DataFrame(), pd.DataFrame(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-@st.cache_data(ttl=10800)
-def fetch_seasonal_climate_data(lat, lon, days=180):
-    """Fetches or simulates S2S seasonal climate outlook."""
-    try:
-        from services.open_meteo import fetch_seasonal_climate
-        data = fetch_seasonal_climate(lat, lon, days=days)
-        if data and "daily" in data:
-            return pd.DataFrame({
-                "time": pd.to_datetime(data["daily"]["time"]),
-                "precipitation_sum": data["daily"]["precipitation_sum"],
-                "temperature_2m_max": data["daily"]["temperature_2m_max"]
-            })
-    except Exception:
-        pass
-    
-    dates_s = pd.date_range(start=datetime.now(), periods=days, freq='D')
-    return pd.DataFrame({
-        "time": dates_s,
-        "precipitation_sum": np.random.uniform(0.5, 4.5, size=days),
-        "temperature_2m_max": np.random.uniform(22.0, 32.0, size=days)
-    })
-
 def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, drought_pipe):
-    """Engineers feature sets and executes tactical flood and short-term drought prediction pipelines."""
+    """Engineers feature sets from live API data and executes hazard predictions."""
     if df_hourly.empty or df_daily.empty:
         dates_h = pd.date_range(start=datetime.now(), periods=16*24, freq='H')
         df_hourly = pd.DataFrame({'time': dates_h, 'rfh_live': 0.0, 'soil_temp': 20.0})
@@ -366,8 +316,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Decision Thresholds")
     st.markdown("""
-    * **Flood Action Cutoff:** `> 50.0%` (Critical Runoff)
-    * **Drought Action Cutoff:** `> 50.0%` (Deficit Stress)
+    * **Flood Action Cutoff:** `> 50.0%`
+    * **Drought Action Cutoff:** `> 50.0%`
     * **Moderate Risk Tier:** `20.0% - 50.0%`
     * **Low Risk Tier:** `< 20.0%`
     """)
@@ -378,7 +328,7 @@ with st.sidebar:
 # --- Data Acquisition & Prediction Execution ---
 with st.spinner(f"Fetching Meteorological Data for {selected_zone_name}..."):
     raw_hourly, raw_daily, api_last_updated = fetch_live_weather(target_row['lat'], target_row['lon'], max_days=16)
-    raw_seasonal = fetch_seasonal_climate_data(target_row['lat'], target_row['lon'], days=180)
+    raw_seasonal = fetch_seasonal_climate(target_row['lat'], target_row['lon'], days=180)
 
 pred_hourly, pred_daily = generate_hazard_predictions(raw_hourly, raw_daily, target_row, flood_model, drought_model)
 
@@ -414,9 +364,9 @@ st.markdown("---")
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("PEAK FLOOD RISK (16-DAY)", f"{current_flood_max:.1f}%", delta="Live Forecast", delta_color="inverse")
-m2.metric("PEAK DROUGHT RISK (6-MONTH S2S)", f"{current_drought_max:.1f}%", delta="ECMWF SEAS5", delta_color="inverse")
+m2.metric("PEAK DROUGHT RISK (6-MONTH S2S)", f"{current_drought_max:.1f}%", delta="Ensemble Active", delta_color="inverse")
 m3.metric("ZONES MONITORED", f"{zones_monitored}", "100% Coverage")
-m4.metric("FORECAST ENGINE", "Open-Meteo S2S", "Ensemble Active")
+m4.metric("FORECAST ENGINE", "Open-Meteo API", "Ensemble Active")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -450,7 +400,7 @@ with tab_drought:
     drought_view = st.radio("Select Drought Prediction Horizon:", ["16-Day Tactical Short-Term", "6-Month Strategic Seasonal Outlook"], horizontal=True, key="d_rad_horizon")
     
     if "6-Month" in drought_view:
-        st.info("📡 Integrating ECMWF SEAS5 180-day climate ensemble anomalies and ML inference pipeline.")
+        st.info("📡 Integrating live climate ensemble anomalies and ML inference pipeline.")
         fig_d = px.area(
             raw_seasonal, x='time', y='drought_risk_prob',
             title=f"6-Month Cumulative S2S Drought Vulnerability Curve (Action Threshold: 50%)",
@@ -557,4 +507,4 @@ with tab_map_drought:
     st_folium(m_drought, width="100%", height=550, key="folium_drought_seasonal", returned_objects=[])
 
 st.markdown("---")
-st.caption(f"🚀 MEHWS Engine | Last API Sync: {api_last_updated} | Powered by Streamlit, Scikit-Learn Ensembles, Folium GIS, and Open-Meteo S2S Live API")
+st.caption(f"🚀 MEHWS Engine | Last API Sync: {api_last_updated} | Powered by Streamlit, Scikit-Learn Ensembles, Folium GIS, and Open-Meteo API")
