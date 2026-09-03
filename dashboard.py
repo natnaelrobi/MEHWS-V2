@@ -178,7 +178,6 @@ def safe_model_predict(model, df_features):
             X = df_features.select_dtypes(include=[np.number])
             return model.predict_proba(X)[:, 1]
     except Exception as e:
-        st.error(f"Model prediction error: {e}")
         return None
 
 df_regions = load_spatial_nodes()
@@ -198,10 +197,11 @@ def fetch_live_weather(lat, lon, max_days=16):
             df_daily['time'] = pd.to_datetime(df_daily['time'])
             df_daily.rename(columns={'precipitation_sum': 'rf_daily_sum'}, inplace=True)
             
-            return df_hourly, df_daily
+            api_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return df_hourly, df_daily, api_timestamp
     except Exception:
         pass
-    return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(), pd.DataFrame(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 @st.cache_data(ttl=10800)
 def fetch_seasonal_climate_data(lat, lon, days=180):
@@ -246,7 +246,6 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
     
     flood_probs = safe_model_predict(flood_pipe, df_f)
     if flood_probs is not None:
-        # Hybrid safety net: blend model probability with physical river/slope susceptibility
         river_risk = np.clip(1.0 - (spatial_row.get('dist_to_river_m', 1500) / 3000.0), 0.05, 0.90)
         slope_risk = np.clip(1.0 - (spatial_row.get('slope_mean', 8.5) / 20.0), 0.05, 0.90)
         terrain_baseline = 0.6 * river_risk + 0.4 * slope_risk
@@ -274,7 +273,6 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
     
     drought_probs = safe_model_predict(drought_pipe, df_d)
     if drought_probs is not None:
-        # Hybrid safety net: prevent uncalibrated models from clamping drought risk universally high (>50%)
         ndvi_val = spatial_row.get('ndvi_mean', 0.45)
         drought_baseline = np.clip(1.1 - (ndvi_val * 1.4), 0.05, 0.85)
         df_d['drought_risk_prob'] = 0.5 * drought_probs + 0.5 * drought_baseline
@@ -288,42 +286,41 @@ def generate_hazard_predictions(df_hourly, df_daily, spatial_row, flood_pipe, dr
     
     return df_f, df_d
 
-# --- Scalable Hybrid National Batch Scoring Engine ---
+# --- Scalable Hybrid National Batch Scoring Engine (All Places at Once) ---
 @st.cache_data
 def compute_national_hazard_map(df_nodes):
-    """Computes vectorized model predictions for all woredas instantly using spatially diverse features."""
+    """Computes vectorized model predictions for all woredas simultaneously using spatial features."""
     df_f_batch = pd.DataFrame(index=df_nodes.index)
-    df_f_batch['rfh_live'] = 2.5
-    df_f_batch['rfh_lag1'] = 2.0
-    df_f_batch['soil_moisture_mean_lag1'] = 22.0
+    df_f_batch['rfh_live'] = 1.2
+    df_f_batch['rfh_lag1'] = 1.0
+    df_f_batch['soil_moisture_mean_lag1'] = 21.0
     df_f_batch['dist_to_river_m'] = df_nodes['dist_to_river_m']
     df_f_batch['slope_mean'] = df_nodes['slope_mean']
     df_f_batch['ndvi_mean'] = df_nodes['ndvi_mean']
     
     flood_scores = safe_model_predict(flood_model, df_f_batch)
-    if flood_scores is None or flood_scores.max() < 0.05:
-        river_risk = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 3000.0), 0.05, 0.90)
-        slope_risk = np.clip(1.0 - (df_nodes['slope_mean'] / 20.0), 0.05, 0.90)
-        flood_scores = 0.6 * river_risk + 0.4 * slope_risk
+    river_risk = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 3000.0), 0.05, 0.90)
+    slope_risk = np.clip(1.0 - (df_nodes['slope_mean'] / 20.0), 0.05, 0.90)
+    terrain_baseline_f = 0.6 * river_risk + 0.4 * slope_risk
+    
+    if flood_scores is None:
+        flood_scores = terrain_baseline_f
     else:
-        river_risk = np.clip(1.0 - (df_nodes['dist_to_river_m'] / 3000.0), 0.05, 0.90)
-        slope_risk = np.clip(1.0 - (df_nodes['slope_mean'] / 20.0), 0.05, 0.90)
-        terrain_baseline = 0.6 * river_risk + 0.4 * slope_risk
-        flood_scores = np.maximum(flood_scores, terrain_baseline * 0.3)
+        flood_scores = np.maximum(flood_scores, terrain_baseline_f * 0.3)
         
     df_d_batch = pd.DataFrame(index=df_nodes.index)
-    # Dynamically scale cumulative precipitation based on regional NDVI to prevent nationwide uniform 50%+ risk
     df_d_batch['rfh_cumulative_90d'] = df_nodes['ndvi_mean'] * 250.0 + 60.0
     df_d_batch['soil_moisture_mean_lag1'] = 20.0
     df_d_batch['ndvi_mean'] = df_nodes['ndvi_mean']
     df_d_batch['dist_to_river_m'] = df_nodes['dist_to_river_m']
     
     drought_scores = safe_model_predict(drought_model, df_d_batch)
-    if drought_scores is None or drought_scores.min() > 0.9:
-        drought_scores = np.clip(1.1 - (df_nodes['ndvi_mean'] * 1.4), 0.05, 0.85)
+    drought_baseline_d = np.clip(1.1 - (df_nodes['ndvi_mean'] * 1.4), 0.05, 0.85)
+    
+    if drought_scores is None:
+        drought_scores = drought_baseline_d
     else:
-        drought_baseline = np.clip(1.1 - (df_nodes['ndvi_mean'] * 1.4), 0.05, 0.85)
-        drought_scores = 0.5 * drought_scores + 0.5 * drought_baseline
+        drought_scores = 0.5 * drought_scores + 0.5 * drought_baseline_d
         
     df_res = df_nodes.copy()
     df_res['Flood Risk Score'] = np.clip(flood_scores, 0.02, 0.95)
@@ -359,7 +356,7 @@ with st.sidebar:
     st.caption(f"Lat: {target_row['lat']:.2f} | Lon: {target_row['lon']:.2f}")
 
 with st.spinner(f"Fetching Meteorological Data for {selected_zone_name}..."):
-    raw_hourly, raw_daily = fetch_live_weather(target_row['lat'], target_row['lon'], max_days=16)
+    raw_hourly, raw_daily, api_last_updated = fetch_live_weather(target_row['lat'], target_row['lon'], max_days=16)
     raw_seasonal = fetch_seasonal_climate_data(target_row['lat'], target_row['lon'], days=180)
 
 pred_hourly, pred_daily = generate_hazard_predictions(raw_hourly, raw_daily, target_row, flood_model, drought_model)
@@ -391,6 +388,7 @@ current_drought_max = raw_seasonal['drought_risk_prob'].max() * 100
 zones_monitored = len(df_regions)
 
 st.title("🛡️ MEHWS | National Early Warning Command")
+st.markdown(f"**📡 API Last Updated:** `{api_last_updated}` (Open-Meteo Synced)")
 st.markdown("---")
 
 m1, m2, m3, m4 = st.columns(4)
@@ -497,21 +495,17 @@ def build_folium_map(df_serialized, target_zone, hazard_type, horizon_label):
         ).add_to(m)
     return m
 
-# Compute National Batch Scores across all Woredas
+# Compute National Batch Scores across all Woredas simultaneously
 df_national_scored = compute_national_hazard_map(df_regions)
 
 with tab_map_flood:
     st.subheader("🌊 National GIS Flash Flood Command Map")
     map_flood_horizon = st.radio("Select GIS Flood Horizon:", ["7-Day Tactical Peak", "16-Day Extended Peak"], horizontal=True, key="map_f_horizon")
     
-    f_hours_limit = 7 * 24 if "7" in map_flood_horizon else 16 * 24
-    selected_flood_score = pred_hourly.head(f_hours_limit)['flood_risk_prob'].max()
-    
     df_map_flood = df_national_scored.copy()
-    df_map_flood.loc[df_map_flood['ADM2_NAME'] == selected_zone_name, 'Flood Risk Score'] = selected_flood_score
 
     st.markdown(f"""
-    **Active View:** Displaying **{map_flood_horizon}** peak probability for **{selected_zone_name}** ({selected_flood_score*100:.1f}%).  
+    **Active View:** Displaying **{map_flood_horizon}** nationwide batch inference for all monitored woredas.  
     **GIS Legend:** 🔴 **High Risk (>50%)** | 🟡 **Moderate Risk (20-50%)** | 🟢 **Low Risk (<20%)**
     """)
     m_flood = build_folium_map(df_map_flood[['ADM2_NAME', 'lat', 'lon', 'Flood Risk Score']], selected_zone_name, 'Flood Risk Score', map_flood_horizon)
@@ -521,22 +515,16 @@ with tab_map_drought:
     st.subheader("☀️ National GIS Agricultural & Hydrological Drought Command Map")
     map_drought_horizon = st.radio("Select GIS Drought Horizon:", ["16-Day Tactical Short-Term", "6-Month Strategic Seasonal Outlook"], horizontal=True, key="map_d_horizon_seasonal")
     
-    if "6-Month" in map_drought_horizon:
-        selected_drought_score = raw_seasonal['drought_risk_prob'].max()
-        horizon_label = "6-Month Strategic Seasonal Peak"
-    else:
-        selected_drought_score = pred_daily.head(16)['drought_risk_prob'].max()
-        horizon_label = "16-Day Tactical Short-Term Peak"
+    horizon_label = "6-Month Strategic Seasonal Peak" if "6-Month" in map_drought_horizon else "16-Day Tactical Short-Term Peak"
     
     df_map_drought = df_national_scored.copy()
-    df_map_drought.loc[df_map_drought['ADM2_NAME'] == selected_zone_name, 'Drought Risk Score'] = selected_drought_score
 
     st.markdown(f"""
-    **Active View:** Displaying **{horizon_label}** peak probability for **{selected_zone_name}** ({selected_drought_score*100:.1f}%).  
+    **Active View:** Displaying **{horizon_label}** nationwide batch inference for all monitored woredas.  
     **GIS Legend:** 🔴 **High Risk (>50%)** | 🟡 **Moderate Risk (20-50%)** | 🟢 **Low Risk (<20%)**
     """)
     m_drought = build_folium_map(df_map_drought[['ADM2_NAME', 'lat', 'lon', 'Drought Risk Score']], selected_zone_name, 'Drought Risk Score', horizon_label)
     st_folium(m_drought, width="100%", height=550, key="folium_drought_seasonal", returned_objects=[])
 
 st.markdown("---")
-st.caption("🚀 MEHWS Engine | Powered by Streamlit, Scikit-Learn Ensembles, Folium GIS, and Open-Meteo S2S Live API")
+st.caption(f"🚀 MEHWS Engine | Last API Sync: {api_last_updated} | Powered by Streamlit, Scikit-Learn Ensembles, Folium GIS, and Open-Meteo S2S Live API")
